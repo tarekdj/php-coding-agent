@@ -1,0 +1,401 @@
+<?php
+
+/**
+ * Minimal CLI coding agent: chats with an LLM and lets it call file-system tools
+ * (read, list, edit, write) in a loop until the model finishes without tool calls.
+ */
+
+/**
+ * Send the conversation (and optional tool definitions) to the chat-completions API.
+ *
+ * @param array $conversation OpenAI-style message history (role + content, etc.)
+ * @param array $tools        Tool schemas for the model (from buildLlmTools)
+ * @return array              Decoded API response (choices, usage, etc.)
+ */
+function callLlm(array $conversation, array $tools = []): array
+{
+    $apiKey = getenv('API_KEY');
+    if (!$apiKey) {
+        throw new \RuntimeException('API_KEY environment variable is not set.');
+    }
+
+    $payload = [
+        "model" => "Qwen3-Coder-30B-A3B-Instruct",
+        "max_tokens" => 512*20,
+        "messages" => $conversation,
+        "temperature" => 0,   // deterministic replies for reproducible tool use
+        "seed" => null,
+        "stream" => false,
+    ];
+
+    // Tool definitions are only included when the agent has tools to offer.
+    if (!empty($tools)) {
+        $payload['tools'] = $tools;
+    }
+
+    $jsonPayload = json_encode($payload);
+
+    $url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions";
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $jsonPayload,
+        // SSL verification disabled — adjust for production if using a trusted CA bundle.
+        CURLOPT_SSL_VERIFYHOST => 0,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $apiKey,
+        ],
+    ]);
+
+    $response = curl_exec($ch);
+    if ($response === false) {
+        throw new \RuntimeException('cURL error: ' . curl_error($ch));
+    }
+
+    $data = json_decode($response, true);
+    if ($data === null) {
+        throw new \RuntimeException("Invalid JSON response from API: " . $response);
+    }
+
+    if (isset($data['error'])) {
+        throw new \RuntimeException('API error: ' . (is_array($data['error']) ? json_encode($data['error']) : $data['error']));
+    }
+
+    return $data;
+}
+
+// Each tool has: name, description, input_schema (JSON Schema), and a PHP callable.
+$tools = [
+    // read file tool
+    [
+        'name' => 'read_file',
+        'description' => 'Read the contents of a given relative file path. Use this when you want to see what\'s inside a file. Do not use this with directory names.',
+        'input_schema' => [
+            'type' => 'object',
+            'properties' => [
+                'path' => [
+                    'type' => 'string',
+                    'description' => 'The relative path of a file in the working directory.',
+                ],
+            ],
+            'required' => ['path'],
+            'additionalProperties' => false,
+        ],
+        'function' => function (array $input): string {
+            $path = $input['path'] ?? '';
+            if ($path === '') {
+                throw new \RuntimeException('path is required');
+            }
+            if (!file_exists($path)) {
+                throw new \RuntimeException("File not found: $path");
+            }
+            $content = file_get_contents($path);
+            if ($content === false) {
+                throw new \RuntimeException("Could not read file: $path");
+            }
+            return $content;
+        },
+    ],
+    // list files tool
+    [
+        'name' => 'list_files',
+        'description' => 'List files and directories at a given path. If no path is provided, lists files in the current directory.',
+        'input_schema' => [
+            'type' => 'object',
+            'properties' => [
+                'path' => [
+                    'type' => 'string',
+                    'description' => 'Optional relative path to list files from. Defaults to current directory if not provided.',
+                ],
+            ],
+            'additionalProperties' => false,
+        ],
+        'function' => function (array $input): string {
+            $dir = $input['path'] ?? '.';
+            if ($dir === '') {
+                $dir = '.';
+            }
+            if (!is_dir($dir)) {
+                throw new \RuntimeException("Not a directory: $dir");
+            }
+
+            $files = [];
+            // Walk the tree recursively; paths are returned relative to $dir.
+            $iterator = new \RecursiveIteratorIterator(
+                    new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+                    \RecursiveIteratorIterator::SELF_FIRST
+                );
+
+            foreach ($iterator as $file) {
+                $relativePath = ltrim(substr($file->getPathname(), strlen($dir)), DIRECTORY_SEPARATOR);
+                $relativePath = str_replace('\\', '/', $relativePath); // normalise on Windows
+                if ($file->isDir()) {
+                    $files[] = $relativePath . '/';
+                }
+                else {
+                    $files[] = $relativePath;
+                }
+            }
+
+            sort($files);
+            return json_encode($files, JSON_UNESCAPED_SLASHES);
+        },
+    ],
+    // edit file tool — search-and-replace a unique substring (or create a new file).
+    [
+        'name' => 'edit_file',
+        'description' => "Make edits to a text file.\n\nReplaces 'old_str' with 'new_str' in the given file. 'old_str' and 'new_str' MUST be different from each other.\n\nIf the file specified with path doesn't exist, it will be created.",
+        'input_schema' => [
+            'type' => 'object',
+            'properties' => [
+                'path' => [
+                    'type' => 'string',
+                    'description' => 'The path to the file.',
+                ],
+                'old_str' => [
+                    'type' => 'string',
+                    'description' => 'Text to search for – must match exactly and must appear only once.',
+                ],
+                'new_str' => [
+                    'type' => 'string',
+                    'description' => 'Text to replace old_str with.',
+                ],
+            ],
+            'required' => ['path', 'old_str', 'new_str'],
+            'additionalProperties' => false,
+        ],
+        'function' => function (array $input): string {
+            $path = $input['path'] ?? '';
+            $oldStr = $input['old_str'] ?? '';
+            $newStr = $input['new_str'] ?? '';
+
+            if ($path === '') {
+                throw new \RuntimeException('path is required');
+            }
+            if ($oldStr === $newStr) {
+                throw new \RuntimeException('old_str and new_str must be different');
+            }
+
+            // File does not exist → create it (only when old_str is empty, i.e. new file).
+            if (!file_exists($path)) {
+                if ($oldStr !== '') {
+                    throw new \RuntimeException("File not found: $path");
+                }
+                $dir = dirname($path);
+                if ($dir !== '.' && !is_dir($dir)) {
+                    if (!mkdir($dir, 0755, true)) {
+                        throw new \RuntimeException("Could not create directory: $dir");
+                    }
+                }
+                if (file_put_contents($path, $newStr) === false) {
+                    throw new \RuntimeException("Could not create file: $path");
+                }
+                return "Successfully created file $path";
+            }
+
+            // File exists — replace old_str with new_str, or overwrite entirely if old_str is empty.
+            $content = file_get_contents($path);
+            if ($content === false) {
+                throw new \RuntimeException("Could not read file: $path");
+            }
+
+            if ($oldStr === '') {
+                $newContent = $newStr;
+            } else {
+                if (!str_contains($content, $oldStr)) {
+                    throw new \RuntimeException('old_str not found in file');
+                }
+                $newContent = str_replace($oldStr, $newStr, $content);
+            }
+            if (file_put_contents($path, $newContent) === false) {
+                throw new \RuntimeException("Could not write file: $path");
+            }
+
+            return 'OK';
+        },
+    ],
+    // write tool — full overwrite (simpler than edit_file when replacing entire contents).
+    [
+        'name' => 'write_file',
+        'description' => 'Write content to a file. Creates the file if it does not exist. Overwrites existing content.',
+        'input_schema' => [
+            'type' => 'object',
+            'properties' => [
+                'path' => [
+                    'type' => 'string',
+                    'description' => 'The path to the file.',
+                ],
+                'content' => [
+                    'type' => 'string',
+                    'description' => 'The content to write to the file.',
+                ],
+            ],
+            'required' => ['path', 'content'],
+            'additionalProperties' => false,
+        ],
+        'function' => function (array $input): string {
+            $path = $input['path'] ?? '';
+            $content = $input['content'] ?? '';
+            if ($path === '') {
+                throw new \RuntimeException('path is required');
+            }
+            $dir = dirname($path);
+            if ($dir !== '.' && !is_dir($dir)) {
+                if (!mkdir($dir, 0755, true)) {
+                    throw new \RuntimeException('Could not create directory: $dir');
+                }
+            }
+            if (file_put_contents($path, $content) === false) {
+                throw new \RuntimeException('Could not write file: $path');
+            }
+            return 'Successfully wrote to $path';
+        },
+    ],
+];
+
+/** Convert internal tool definitions into the OpenAI "tools" array shape. */
+function buildLlmTools(array $tools): array
+{
+    return array_map(fn($t) => [
+        'type' => 'function',
+        'function' => [
+            'name' => $t['name'],
+            'description' => $t['description'],
+            'parameters' => $t['input_schema'],
+        ],
+    ], $tools);
+}
+
+/** Run a tool by name; errors are returned as strings so the LLM can recover. */
+function executeTool(string $toolName, array $toolInput, array $tools): string
+{
+    foreach ($tools as $tool) {
+        if ($tool['name'] === $toolName) {
+            try {
+                return ($tool['function'])($toolInput);
+            }
+            catch (\Throwable $e) {
+                return 'Error: ' . $e->getMessage();
+            }
+        }
+    }
+    return 'Error: tool not found – ' . $toolName;
+}
+
+// ANSI escape codes for colored terminal output.
+function blue(string $s): string
+{
+    return "\033[94m$s\033[0m";
+}
+function yellow(string $s): string
+{
+    return "\033[93m$s\033[0m";
+}
+function green(string $s): string
+{
+    return "\033[92m$s\033[0m";
+}
+
+/**
+ * Main REPL: read user input, call the LLM, execute any tool calls, repeat.
+ *
+ * When the model requests tools, results are appended to $conversation and the
+ * loop continues without prompting the user again until the model stops calling tools.
+ */
+function runAgent(array $tools = []): void
+{
+    $conversation = [];
+
+    $conversation[] = [
+        'role' => 'system',
+        'content' => 'You are a helpful coding assistant. Your name is Agent 007',
+    ];    
+
+    $llmTools = function_exists('buildLlmTools') ? buildLlmTools($tools) : [];
+
+    echo "Chat with Agent (use Ctrl-C to quit)\n\n";
+
+    // When false, skip reading stdin and immediately call the LLM again (after tool results).
+    $readUserInput = true;
+
+    while (true) {
+        if ($readUserInput) {
+            echo blue('You') . ': ';
+            $userInput = fgets(STDIN);
+            if ($userInput === false) {
+                break; // EOF / Ctrl-D
+            }
+            $userInput = trim($userInput);
+            if ($userInput === '') {
+                continue;
+            }
+
+            $conversation[] = [
+                'role' => 'user',
+                'content' => $userInput,
+            ];
+        }
+
+        $response = callLlm($conversation, $llmTools);
+        $message = $response['choices'][0]['message'] ?? null;
+
+        if (!$message) {
+            throw new \RuntimeException("Unexpected API response: " . json_encode($response));
+        }
+
+        // Keep the assistant message (including tool_calls) in history for the next API round.
+        $conversation[] = $message;
+
+        if (!empty($message['content'])) {
+            echo yellow('Agent') . ': ' . $message['content'] . "\n";
+        }
+
+        $toolResults = [];
+        $readUserInput = true;
+
+        if (function_exists('executeTool') && !empty($message['tool_calls'])) {
+            foreach ($message['tool_calls'] as $toolCall) {
+                if ($toolCall['type'] === 'function') {
+                    $toolName = $toolCall['function']['name'];
+                    $toolInputStr = $toolCall['function']['arguments'];
+                    $toolInput = json_decode($toolInputStr, true) ?? [];
+                    $toolId = $toolCall['id'];
+
+                    $inputOutput = json_encode($toolInput, JSON_UNESCAPED_SLASHES);
+                    echo green('tool') . ": {$toolName}({$inputOutput})\n";
+
+                    $result = executeTool($toolName, $toolInput, $tools);
+
+                    // OpenAI expects one tool message per tool_call_id.
+                    $toolResults[] = [
+                        'role' => 'tool',
+                        'tool_call_id' => $toolId,
+                        'name' => $toolName,
+                        'content' => $result,
+                    ];
+                }
+            }
+        }
+
+        if (!empty($toolResults)) {
+            foreach ($toolResults as $tr) {
+                $conversation[] = $tr;
+            }
+            // Let the model continue reasoning on tool output before asking the user again.
+            $readUserInput = false;
+        }
+
+        $finishReason = $response['choices'][0]['finish_reason'] ?? '';
+        if ($finishReason === 'stop' && empty($toolResults)) {
+            $readUserInput = true;
+        }
+    }
+
+    echo "\nGoodbye!\n";
+}
+
+runAgent($tools);
