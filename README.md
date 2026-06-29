@@ -214,6 +214,7 @@ Compare your `agent.php` with `final-code/agent.php`. The reference includes doc
 
 ## Resources
 
+* https://harness-books.agentway.dev/en/
 * https://ampcode.com/notes/how-to-build-an-agent
 * https://levelup.gitconnected.com/building-claude-code-with-harness-engineering-d2e8c0da85f0
 * https://addyosmani.com/blog/agent-harness-engineering/
